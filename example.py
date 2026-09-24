@@ -2,74 +2,73 @@ import hashlib
 from typing import List, Optional
 
 
-def _hash(dato: bytes) -> bytes: return hashlib.sha256(dato).digest()
+def _hash(data: bytes) -> bytes: return hashlib.sha256(data).digest()
 
 
-def radice_merkle(foglie: List[bytes]) -> bytes:
-    if not foglie: return _hash(b"")
+def merkle_root(leaves: List[bytes]) -> bytes:
+    if not leaves: return _hash(b"")
 
-    livello = list(foglie)
-    while len(livello) > 1:
-        if len(livello) % 2 == 1:
-            livello.append(livello[-1])  # duplica l'ultimo nodo dispari
+    level = list(leaves)
+    while len(level) > 1:
+        if len(level) % 2 == 1:
+            level.append(level[-1])  # duplicate the last odd node
 
-        livello_successivo = []
-        for i in range(0, len(livello), 2):
-            livello_successivo.append(_hash(livello[i] + livello[i + 1]))
-        livello = livello_successivo
+        next_level = []
+        for i in range(0, len(level), 2):
+            next_level.append(_hash(level[i] + level[i + 1]))
+        level = next_level
 
-    return livello[0]
+    return level[0]
 
 
 class LogIndex:
     """
 
-    Componenti:
-      - self.voci: il log sequenziale vero e proprio (equivalente alle
-        "index entries" della EIP): ogni stringa inserita viene aggiunta in
-        coda e la sua posizione (l'indice nell'array) diventa il suo
-        identificativo permanente.
-      - self.voci_per_epoca: quante voci consecutive condividono la stessa
-        filter-map (equivalente a VALUES_PER_MAP nella EIP reale). Nella
-        realtà è un numero grande (decine di migliaia); qui è piccolo per
-        rendere visibile il passaggio da un'epoca alla successiva.
-      - self.mapping_frequency_by_layer: una frequenza di raggruppamento
-        delle epoche per ciascun livello (equivalente a
-        2 ** LOG2_MAPPING_FREQUENCY nella EIP reale, dove vale
-        [1024, 64, 4, 1]). Più alta è la frequenza di un livello, più
-        epoche consecutive condividono la stessa riga a quel livello.
-      - self.max_row_length_by_layer: quante colonne può contenere al
-        massimo una riga di ciascun livello prima di dover spostare le
-        voci in eccesso al livello successivo (equivalente a
-        MAX_ROW_LENGTH nella EIP reale, dove vale [8, 168, 2728, 10920]).
-      - self.mappe: una filter-map per ogni epoca (equivalenti alle
-        "filter map" della EIP). self.mappe[epoca][riga] è la lista delle
-        COLONNE (solo interi, nessuna posizione) registrate in quella riga
-        di quell'epoca: la struttura non memorizza mai esplicitamente
-        "questa colonna appartiene a questa posizione", esattamente come la
-        EIP reale. È compito della ricerca ricostruirlo provando le
-        posizioni candidate (vedi cerca()).
+    Components:
+      - self.entries: the actual sequential log (equivalent to the EIP's
+        "index entries"): every inserted string is appended at the end and
+        its position (its index in the array) becomes its permanent
+        identifier.
+      - self.entries_per_epoch: how many consecutive entries share the same
+        filter map (equivalent to VALUES_PER_MAP in the real EIP). In the
+        real thing it is a large number (tens of thousands); here it is
+        small to make the switch from one epoch to the next visible.
+      - self.mapping_frequency_by_layer: a grouping frequency of the epochs
+        for each layer (equivalent to 2 ** LOG2_MAPPING_FREQUENCY in the
+        real EIP, where it is [1024, 64, 4, 1]). The higher the frequency
+        of a layer, the more consecutive epochs share the same row at that
+        layer.
+      - self.max_row_length_by_layer: how many columns a row of each layer
+        can hold at most before the excess entries have to move to the next
+        layer (equivalent to MAX_ROW_LENGTH in the real EIP, where it is
+        [8, 168, 2728, 10920]).
+      - self.maps: one filter map per epoch (equivalent to the EIP's
+        "filter maps"). self.maps[epoch][row] is the list of COLUMNS (plain
+        integers, no position) recorded in that row of that epoch: the
+        structure never stores explicitly "this column belongs to this
+        position", exactly like the real EIP. It is up to the search to
+        reconstruct it by trying the candidate positions (see search()).
 
-    I valori usati qui per mapping_frequency_by_layer e
-    max_row_length_by_layer sono molto più piccoli di quelli della EIP,
-    per restare visibili con solo poche decine di voci di esempio:
-    la formula e il meccanismo (più livelli, ciascuno con una propria
-    frequenza di raggruppamento e una propria capacità, con spostamento al
-    livello successivo quando una riga è piena) sono però identici.
+    The values used here for mapping_frequency_by_layer and
+    max_row_length_by_layer are much smaller than those of the EIP, so that
+    they stay visible with only a few dozen example entries: the formula and
+    the mechanism (several layers, each with its own grouping frequency and
+    its own capacity, with a move to the next layer when a row is full) are
+    however identical.
     """
 
     def __init__(
         self,
-        voci_per_epoca: int = 5,
-        numero_righe: int = 4,
-        bit_colonna: int = 6,
+        entries_per_epoch: int = 5,
+        number_of_rows: int = 4,
+        column_bits: int = 6,
         mapping_frequency_by_layer: Optional[List[int]] = None,
         max_row_length_by_layer: Optional[List[int]] = None,
     ):
-        self.voci: List[str] = []
-        self.voci_per_epoca = voci_per_epoca
-        self.numero_righe = numero_righe
-        self.bit_colonna = bit_colonna
+        self.entries: List[str] = []
+        self.entries_per_epoch = entries_per_epoch
+        self.number_of_rows = number_of_rows
+        self.column_bits = column_bits
 
         if mapping_frequency_by_layer is None:
             mapping_frequency_by_layer = [4, 2, 1, 1]
@@ -78,223 +77,218 @@ class LogIndex:
         self.mapping_frequency_by_layer = mapping_frequency_by_layer
         self.max_row_length_by_layer = max_row_length_by_layer
 
-        # Una mappa per epoca; ogni mappa è una lista di 'numero_righe'
-        # righe; ogni riga è una lista di colonne (interi). 
-        self.mappe: List[List[List[int]]] = []
-        self._foglie_merkle: List[bytes] = []
-        # Solo a fini illustrativi (non parte del meccanismo): tiene traccia
-        # del livello in cui è effettivamente finita ogni voce inserita,
-        # utile per mostrare nella demo quando avviene uno spostamento di
-        # livello per riga piena.
-        self._livello_di_ogni_voce: List[int] = []
+        # One map per epoch; every map is a list of 'number_of_rows'
+        # rows; every row is a list of columns (integers).
+        self.maps: List[List[List[int]]] = []
+        self._merkle_leaves: List[bytes] = []
+        # For illustration only (not part of the mechanism): keeps track of
+        # the layer in which every inserted entry actually ended up, useful
+        # to show in the demo when a move to another layer happens because
+        # of a full row.
+        self._layer_of_each_entry: List[int] = []
 
-    def _riga(self, valore: str, epoca: int, layer_index: int) -> int:
+    def _row(self, value: str, epoch: int, layer_index: int) -> int:
 
         mapping_frequency = self.mapping_frequency_by_layer[layer_index]
-        masked_epoch = epoca - (epoca % mapping_frequency)
-        dato = (
-            valore.encode("utf-8")
+        masked_epoch = epoch - (epoch % mapping_frequency)
+        data = (
+            value.encode("utf-8")
             + masked_epoch.to_bytes(4, byteorder="big")
             + layer_index.to_bytes(4, byteorder="big")
         )
-        hash_intero = int.from_bytes(_hash(dato), byteorder="big")
-        return hash_intero % self.numero_righe
+        integer_hash = int.from_bytes(_hash(data), byteorder="big")
+        return integer_hash % self.number_of_rows
 
-    def _colonna(self, valore: str, posizione: int) -> int:
+    def _column(self, value: str, position: int) -> int:
 
-        dato = valore.encode("utf-8") + posizione.to_bytes(4, byteorder="big")
-        hash_intero = int.from_bytes(_hash(dato), byteorder="big")
-        return hash_intero % (1 << self.bit_colonna)
+        data = value.encode("utf-8") + position.to_bytes(4, byteorder="big")
+        integer_hash = int.from_bytes(_hash(data), byteorder="big")
+        return integer_hash % (1 << self.column_bits)
 
-    def inserisci(self, valore: str) -> int:
-        posizione = len(self.voci)
-        self.voci.append(valore)
+    def insert(self, value: str) -> int:
+        position = len(self.entries)
+        self.entries.append(value)
 
-        epoca = posizione // self.voci_per_epoca
-        if epoca == len(self.mappe):
-            # Prima voce di una nuova epoca: si apre una nuova filter-map
-            # fatta di 'numero_righe' righe inizialmente vuote.
-            nuova_mappa = []
-            for _ in range(self.numero_righe):
-                nuova_mappa.append([])
-            self.mappe.append(nuova_mappa)
+        epoch = position // self.entries_per_epoch
+        if epoch == len(self.maps):
+            # First entry of a new epoch: a new filter map is opened,
+            # made of 'number_of_rows' initially empty rows.
+            new_map = []
+            for _ in range(self.number_of_rows):
+                new_map.append([])
+            self.maps.append(new_map)
 
-        colonna = self._colonna(valore, posizione)
+        column = self._column(value, position)
 
         layer_index = 0
         while True:
-            riga = self._riga(valore, epoca, layer_index)
-            colonne_della_riga = self.mappe[epoca][riga]
-            ultimo_layer_disponibile = len(self.max_row_length_by_layer) - 1
-            capacita_massima = self.max_row_length_by_layer[
-                min(layer_index, ultimo_layer_disponibile)
+            row = self._row(value, epoch, layer_index)
+            row_columns = self.maps[epoch][row]
+            last_available_layer = len(self.max_row_length_by_layer) - 1
+            max_capacity = self.max_row_length_by_layer[
+                min(layer_index, last_available_layer)
             ]
-            if len(colonne_della_riga) < capacita_massima:
-                colonne_della_riga.append(colonna)
+            if len(row_columns) < max_capacity:
+                row_columns.append(column)
                 break
             layer_index += 1
 
-        self._livello_di_ogni_voce.append(layer_index)
-        self._foglie_merkle.append(_hash(valore.encode("utf-8")))
-        return posizione
+        self._layer_of_each_entry.append(layer_index)
+        self._merkle_leaves.append(_hash(value.encode("utf-8")))
+        return position
 
-    def cerca(self, valore: str) -> Optional[int]:
+    def search(self, value: str) -> Optional[int]:
         """
-        Cerca 'valore' nell'indice e restituisce la posizione della prima
-        occorrenza trovata (scandendo le epoche dalla più vecchia alla più
-        recente, e per ciascuna i livelli dal più basso al più alto),
-        oppure None se non è presente in nessuna epoca.
+        Searches for 'value' in the index and returns the position of the
+        first occurrence found (scanning the epochs from the oldest to the
+        most recent, and for each one the layers from the lowest to the
+        highest), or None if it is not present in any epoch.
 
-        Per ogni epoca già esistente, e per ciascun livello:
-          1. si calcola la riga in cui 'valore' sarebbe stato registrato
-             in quell'epoca, a quel livello. Grazie al raggruppamento (vedi
-             _riga), epoche consecutive dello stesso gruppo, allo stesso
-             livello, producono la stess riga: qui la si ricalcola
-             comunque a ogni iterazione per semplicità del codice, ma un
-             client reale sfrutterebbe questa stabilità per recuperare in
-             un solo accesso i dati di un intero gruppo di epoche, invece
-             di ripetere l'operazione una per una;
-          2. se quella riga è vuota, si passa subito al livello successivo
-             (o all'epoca successiva, se i livelli sono finiti): il grosso
-             del risparmio rispetto a uno scorrimento completo del log è
-             che si leggono poche righe per epoca, non l'intera mappa né
-             l'intero log;
-          3. altrimenti si provano, una per una, tutte le posizioni
-             possibili di quell'epoca: per ciascuna si calcola la colonna
-             che 'valore' avrebbe se fosse davvero a quella posizione
-             (_colonna dipende dalla posizione, non dal livello), e si
-             controlla se compare fra le colonne registrate nella riga;
-          4. una colonna coincidente è solo un candidato (due valori
-             diversi possono produrre la stessa colonna per coincidenza):
-             va confermato leggendo la voce reale a quella posizione. Solo
-             se corrisponde esattamente si restituisce la posizione.
+        For every existing epoch, and for each layer:
+          1. the row in which 'value' would have been recorded in that
+             epoch, at that layer, is computed. Thanks to the grouping (see
+             _row), consecutive epochs of the same group, at the same
+             layer, produce the same row: here it is recomputed at every
+             iteration for simplicity of the code, but a real client would
+             exploit this stability to retrieve the data of a whole group
+             of epochs in a single access, instead of repeating the
+             operation one by one;
+          2. if that row is empty, we move on immediately to the next layer
+             (or to the next epoch, if the layers are over): the bulk of
+             the saving compared with a full scan of the log is that few
+             rows are read per epoch, not the whole map nor the whole log;
+          3. otherwise all the possible positions of that epoch are tried,
+             one by one: for each one the column that 'value' would have if
+             it were really at that position is computed (_column depends
+             on the position, not on the layer), and we check whether it
+             appears among the columns recorded in the row;
+          4. a matching column is only a candidate (two different values
+             may produce the same column by coincidence): it has to be
+             confirmed by reading the real entry at that position. The
+             position is returned only if it matches exactly.
         """
-        for epoca in range(len(self.mappe)):
+        for epoch in range(len(self.maps)):
             for layer_index in range(len(self.mapping_frequency_by_layer)):
-                riga = self._riga(valore, epoca, layer_index)
-                colonne_della_riga = self.mappe[epoca][riga]
+                row = self._row(value, epoch, layer_index)
+                row_columns = self.maps[epoch][row]
 
-                if len(colonne_della_riga) == 0:
+                if len(row_columns) == 0:
                     continue
 
-                inizio_epoca = epoca * self.voci_per_epoca
-                fine_epoca = min(inizio_epoca + self.voci_per_epoca, len(self.voci))
+                epoch_start = epoch * self.entries_per_epoch
+                epoch_end = min(epoch_start + self.entries_per_epoch, len(self.entries))
 
-                for posizione_candidata in range(inizio_epoca, fine_epoca):
-                    colonna_attesa = self._colonna(valore, posizione_candidata)
-                    if colonna_attesa in colonne_della_riga:
-                        if self.voci[posizione_candidata] == valore:
-                            return posizione_candidata
+                for candidate_position in range(epoch_start, epoch_end):
+                    expected_column = self._column(value, candidate_position)
+                    if expected_column in row_columns:
+                        if self.entries[candidate_position] == value:
+                            return candidate_position
 
         return None
 
-    def radice(self) -> bytes:
-        """Impegno crittografico (radice di Merkle) sull'intero contenuto
-        del log, nell'ordine in cui le voci sono state inserite."""
-        return radice_merkle(self._foglie_merkle)
+    def root(self) -> bytes:
+        """Cryptographic commitment (Merkle root) over the whole content of
+        the log, in the order in which the entries were inserted."""
+        return merkle_root(self._merkle_leaves)
 
 
 def main() -> None:
-    array_di_stringhe = [
-        "mela", "banana", "arancia", "kiwi", "pera", "uva", "fragola",
-        "ananas", "mango", "papaya", "ciliegia", "limone", "pesca",
-        "albicocca", "melone", "anguria", "fico", "nespola", "cachi",
-        "mirtillo"]
+    string_array = [
+        "apple", "banana", "orange", "kiwi", "pear", "grape", "strawberry",
+        "pineapple", "mango", "papaya", "cherry", "lemon", "peach",
+        "apricot", "melon", "watermelon", "fig", "medlar", "persimmon",
+        "blueberry"]
 
-    #Inizializzazione
-    indice = LogIndex(voci_per_epoca=5, numero_righe=4, bit_colonna=6)
-
-
-    print("\n=== Inserimento dell'array di stringhe ===")
-    for parola in array_di_stringhe:
-        posizione = indice.inserisci(parola)
+    #Initialization
+    index = LogIndex(entries_per_epoch=5, number_of_rows=4, column_bits=6)
 
 
-    print(f"\nElementi inseriti: {len(array_di_stringhe)}")
-    print(f"Epoche create finora: {len(indice.mappe)}")
-    print(f"Radice di Merkle del LogIndex: {indice.radice().hex()}")
+    print("\n=== Insertion of the string array ===")
+    for word in string_array:
+        position = index.insert(word)
 
-    print("\n=== La riga resta stabile per un gruppo di epoche, poi cambia (livello 0) ===")
-    # Al livello 0, mapping_frequency_by_layer[0] = 4: le epoche 0, 1, 2 e 3
-    # condividono lo stesso calcolo di riga (stesso gruppo); l'epoca 4 apre
-    # un nuovo gruppo e la riga può cambiare. Lo mostriamo calcolando la
-    # riga che "mela" avrebbe in ciascuna di queste epoche, SENZA bisogno di
-    # reinserirla: _riga dipende solo dal valore, dall'epoca e dal livello.
-    frequenza_livello_0 = indice.mapping_frequency_by_layer[0]
-    for epoca_di_prova in range(0, frequenza_livello_0 + 1):
-        riga_calcolata = indice._riga("mela", epoca_di_prova, layer_index=0)
-        gruppo = epoca_di_prova // frequenza_livello_0
-        print(f"  'mela' nell'epoca {epoca_di_prova} (gruppo {gruppo}) -> riga {riga_calcolata}")
-    print(
-        f"  Le prime {frequenza_livello_0} epoche (stesso gruppo) danno la STESSA riga: un client può"
-    )
-    print(
-        "  leggere o dimostrare (Merkle proof) i dati di tutto il gruppo con un solo accesso."
-    )
 
-    print("\n=== La stessa parola, in gruppi di epoche diversi, può finire in righe diverse ===")
-    # "banana" è già stata inserita una volta (posizione 1, epoca 0). La
-    # reinseriamo qui, molte voci dopo: cade in un'epoca di un gruppo
-    # successivo (a livello 0), e la sua riga viene ricalcolata da zero.
-    prima_posizione = 1
-    prima_epoca = prima_posizione // indice.voci_per_epoca
-    prima_riga = indice._riga("banana", prima_epoca, layer_index=0)
+    print(f"\nEntries inserted: {len(string_array)}")
+    print(f"Epochs created so far: {len(index.maps)}")
+    print(f"Merkle root of the LogIndex: {index.root().hex()}")
 
-    seconda_posizione = indice.inserisci("banana")
-    seconda_epoca = seconda_posizione // indice.voci_per_epoca
-    seconda_riga = indice._riga("banana", seconda_epoca, layer_index=0)
+    print("\n=== The row stays stable for a group of epochs, then changes (layer 0) ===")
+    # At layer 0, mapping_frequency_by_layer[0] = 4: epochs 0, 1, 2 and 3
+    # share the same row computation (same group); epoch 4 opens a new
+    # group and the row may change. We show it by computing the row that
+    # "apple" would have in each of these epochs, WITHOUT reinserting it:
+    # _row only depends on the value, the epoch and the layer.
+    layer_0_frequency = index.mapping_frequency_by_layer[0]
+    for test_epoch in range(0, layer_0_frequency + 1):
+        computed_row = index._row("apple", test_epoch, layer_index=0)
+        group = test_epoch // layer_0_frequency
+        print(f"  'apple' in epoch {test_epoch} (group {group}) -> row {computed_row}")
+    print(f"  The first {layer_0_frequency} epochs (same group) give the SAME row: a client can")
+    print("read or prove (Merkle proof) the data of the whole group with a single access.")
+
+    print("\n=== The same word, in different groups of epochs, may end up in different rows ===")
+    # "banana" has already been inserted once (position 1, epoch 0). It is
+    # reinserted here, many entries later: it falls in an epoch of a later
+    # group (at layer 0), and its row is recomputed from scratch.
+    first_position = 1
+    first_epoch = first_position // index.entries_per_epoch
+    first_row = index._row("banana", first_epoch, layer_index=0)
+
+    second_position = index.insert("banana")
+    second_epoch = second_position // index.entries_per_epoch
+    second_row = index._row("banana", second_epoch, layer_index=0)
 
     print(
-        f"  1a 'banana' -> posizione {prima_posizione}, epoca {prima_epoca}, "
-        f"gruppo {prima_epoca // frequenza_livello_0} (livello 0), riga {prima_riga}"
+        f"  1st 'banana' -> position {first_position}, epoch {first_epoch}, "
+        f"group {first_epoch // layer_0_frequency} (layer 0), row {first_row}"
     )
     print(
-        f"  2a 'banana' -> posizione {seconda_posizione}, epoca {seconda_epoca}, "
-        f"gruppo {seconda_epoca // frequenza_livello_0} (livello 0), riga {seconda_riga}"
+        f"  2nd 'banana' -> position {second_position}, epoch {second_epoch}, "
+        f"group {second_epoch // layer_0_frequency} (layer 0), row {second_row}"
     )
-    if prima_riga != seconda_riga:
-        print("  Gruppi diversi, RIGHE DIVERSE: la filter-map non si 'sporca' sempre nello stesso punto.")
+    if first_row != second_row:
+        print("  Different groups, DIFFERENT ROWS: the filter map does not always 'get dirty' in the same place.")
     else:
-        print("  (in questa esecuzione le due righe coincidono per coincidenza: può capitare, non è garantito)")
+        print("  (in this run the two rows coincide by chance: it can happen, it is not guaranteed)")
 
 
-    print("\n=== Ricerca di valori PRESENTI nell'array ===")
-    for parola in ["banana", "mirtillo", "fico"]:
-        posizione = indice.cerca(parola)
+    print("\n=== Search for values PRESENT in the array ===")
+    for word in ["banana", "blueberry", "fig"]:
+        position = index.search(word)
         print(
-            f"  '{parola}': LogIndex -> trovato in posizione {posizione}"
+            f"  '{word}': LogIndex -> found at position {position}"
         )
 
-    print("\n=== Ricerca di valori ASSENTI dall'array ===")
-    # "mandorla" non è mai stata inserita, ma il suo hash accende per
-    # coincidenza tutti i bit già accesi da altre parole: è un falso
-    # positivo del Bloom filter. "avocado" invece non lo è, ed è
-    # correttamente riconosciuta come assente da entrambe le strutture.
-    for parola in ["avocado", "mandorla"]:
-        posizione = indice.cerca(parola)
+    print("\n=== Search for values ABSENT from the array ===")
+    # "almond" was never inserted, but its hash switches on by coincidence
+    # all the bits already switched on by other words: it is a Bloom filter
+    # false positive. "avocado" instead is not, and is correctly
+    # recognised as absent by both structures.
+    for word in ["avocado", "almond"]:
+        position = index.search(word)
         print(
-            f"  '{parola}': LogIndex -> {posizione} (None = assente)"
+            f"  '{word}': LogIndex -> {position} (None = absent)"
         )
 
-    # print("\n=== Stampa dell'intera filter map ===")
+    # print("\n=== Print of the whole filter map ===")
 
-    # for epoca in range(len(indice.mappe)):
-    #     gruppo_livello_0 = epoca // frequenza_livello_0
-    #     print(f"\n  epoca {epoca} (gruppo di livello 0: {gruppo_livello_0}):")
-    #     inizio_epoca = epoca * indice.voci_per_epoca
-    #     fine_epoca = min(inizio_epoca + indice.voci_per_epoca, len(indice.voci))
+    # for epoch in range(len(index.maps)):
+    #     layer_0_group = epoch // layer_0_frequency
+    #     print(f"\n  epoch {epoch} (layer 0 group: {layer_0_group}):")
+    #     epoch_start = epoch * index.entries_per_epoch
+    #     epoch_end = min(epoch_start + index.entries_per_epoch, len(index.entries))
 
-    #     for riga in range(indice.numero_righe):
-    #         colonne_memorizzate = indice.mappe[epoca][riga]
+    #     for row in range(index.number_of_rows):
+    #         stored_columns = index.maps[epoch][row]
 
-    #         voci_di_questa_riga = []
-    #         for posizione in range(inizio_epoca, fine_epoca):
-    #             valore = indice.voci[posizione]
-    #             livello_reale = indice._livello_di_ogni_voce[posizione]
-    #             if indice._riga(valore, epoca, livello_reale) == riga:
-    #                 voci_di_questa_riga.append(f"{valore} (livello {livello_reale})")
+    #         entries_of_this_row = []
+    #         for position in range(epoch_start, epoch_end):
+    #             value = index.entries[position]
+    #             real_layer = index._layer_of_each_entry[position]
+    #             if index._row(value, epoch, real_layer) == row:
+    #                 entries_of_this_row.append(f"{value} (layer {real_layer})")
 
-    #         print(f"    riga {riga}: colonne={colonne_memorizzate} -> voci={voci_di_questa_riga}")
+    #         print(f"    row {row}: columns={stored_columns} -> entries={entries_of_this_row}")
 
 
 if __name__ == "__main__":
