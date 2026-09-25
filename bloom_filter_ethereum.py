@@ -18,20 +18,15 @@ digest):
         b = big_endian_uint16(h[i:i+2]) & 0x7FF    # low 11 bits -> 0..2047
         set bit b of the filter
 
-That is 3 bits per value (m=2048, k=3). go-ethereum stores the filter as a
-big-endian 2048-bit integer, so "bit b" is exactly bit b of a Python int.
+That is 3 bits per value (m=2048, k=3, fixed by the protocol: this module
+only models the real Ethereum filter, no other shape). go-ethereum stores
+the filter as a big-endian 2048-bit integer, so "bit b" is exactly bit b of
+a Python int.
 
 Hash note: as in the rest of the project, Ethereum's Keccak-256 is replaced
 by SHA3-256 (same output size and statistical properties, different
 padding). It does not change the false positive rate that is measured, but
 the filters built here are not bit-identical to the mainnet ones.
-
-Generic filters
----------------
-To compare filters at the same SIZE as the Log Index (a fair question: "what
-if the bloom filter had the same number of bytes?") the module also offers
-generic filters (m bits, k <= 8 hash functions) whose bit positions are the
-first k 4-byte words of the same digest, modulo m.
 """
 
 import hashlib
@@ -39,28 +34,10 @@ import math
 from dataclasses import dataclass
 from typing import Dict, List, Set, Tuple
 
-
-@dataclass(frozen=True)
-class BloomSpec:
-    """Shape of a bloom filter."""
-
-    name: str
-    m_bits: int
-    k: int
-    ethereum_exact: bool = False
-
-    def __post_init__(self) -> None:
-        if self.ethereum_exact and (self.m_bits != 2048 or self.k != 3):
-            raise ValueError("the exact Ethereum formula is only defined for m=2048, k=3")
-        if not self.ethereum_exact and not 1 <= self.k <= 8:
-            raise ValueError("generic filters support 1 <= k <= 8 (k 4-byte words of a 32-byte digest)")
-
-    @property
-    def size_bytes(self) -> int:
-        return (self.m_bits + 7) // 8
-
-
-ETHEREUM_BLOOM = BloomSpec("ethereum_2048_k3", 2048, 3, ethereum_exact=True)
+BLOOM_BIT_LENGTH = 2048
+BLOOM_SIZE_BYTES = BLOOM_BIT_LENGTH // 8  # 256
+BLOOM_K = 3
+BIT_MASK_11 = 0x7FF  # 2**11 - 1: low 11 bits of each 2-byte group (2**11 = 2048)
 
 
 def value_digest(value: bytes) -> bytes:
@@ -68,18 +45,16 @@ def value_digest(value: bytes) -> bytes:
     return hashlib.sha3_256(value).digest()
 
 
-def bit_positions(spec: BloomSpec, digest: bytes) -> List[int]:
-    """The bit positions that a value with this digest sets in a filter of shape `spec`."""
-    if spec.ethereum_exact:
-        return [int.from_bytes(digest[i : i + 2], "big") & 0x7FF for i in (0, 2, 4)]
-    return [int.from_bytes(digest[4 * i : 4 * i + 4], "big") % spec.m_bits for i in range(spec.k)]
+def bit_positions(digest: bytes) -> List[int]:
+    """The 3 bit positions (0..2047) that a value with this digest sets in the filter."""
+    return [int.from_bytes(digest[i : i + 2], "big") & BIT_MASK_11 for i in (0, 2, 4)]
 
 
-def bit_mask(spec: BloomSpec, digest: bytes) -> int:
+def bit_mask(digest: bytes) -> int:
     """The positions of `bit_positions` as an integer mask: a value may be
     in a filter iff `bits & mask == mask`."""
     mask = 0
-    for position in bit_positions(spec, digest):
+    for position in bit_positions(digest):
         mask |= 1 << position
     return mask
 
@@ -87,24 +62,23 @@ def bit_mask(spec: BloomSpec, digest: bytes) -> int:
 class BlockBloom:
     """The bloom filter of one block, as one Python integer."""
 
-    __slots__ = ("spec", "bits")
+    __slots__ = ("bits",)
 
-    def __init__(self, spec: BloomSpec = ETHEREUM_BLOOM) -> None:
-        self.spec = spec
+    def __init__(self) -> None:
         self.bits = 0
 
     def add(self, value: bytes) -> None:
-        self.bits |= bit_mask(self.spec, value_digest(value))
+        self.bits |= bit_mask(value_digest(value))
 
     def might_contain(self, value: bytes) -> bool:
-        mask = bit_mask(self.spec, value_digest(value))
+        mask = bit_mask(value_digest(value))
         return self.bits & mask == mask
 
     def bits_set(self) -> int:
         return bin(self.bits).count("1")
 
     def to_bytes(self) -> bytes:
-        return self.bits.to_bytes(self.spec.size_bytes, "big")
+        return self.bits.to_bytes(BLOOM_SIZE_BYTES, "big")
 
 
 @dataclass
@@ -123,14 +97,13 @@ class BloomIndex:
     dataset without keeping it.
     """
 
-    def __init__(self, spec: BloomSpec = ETHEREUM_BLOOM) -> None:
-        self.spec = spec
+    def __init__(self) -> None:
         self.filters: Dict[int, BlockBloom] = {}
         self.values: Dict[int, Set[bytes]] = {}
 
     def add_event(self, block_id: int, address: bytes, topic: bytes) -> None:
         if block_id not in self.filters:
-            self.filters[block_id] = BlockBloom(self.spec)
+            self.filters[block_id] = BlockBloom()
             self.values[block_id] = set()
         for value in (address, topic):
             self.filters[block_id].add(value)
@@ -149,9 +122,10 @@ class BloomIndex:
 
     def size_bytes(self) -> int:
         """Bytes of all the filters: fixed per block, whatever it contains."""
-        return len(self.filters) * self.spec.size_bytes
+        return len(self.filters) * BLOOM_SIZE_BYTES
 
 
-def theoretical_fp_probability(spec: BloomSpec, distinct_values: float) -> float:
-    """Standard bloom filter formula p = (1 - e^(-k n / m))^k for n distinct values."""
-    return (1 - math.exp(-spec.k * distinct_values / spec.m_bits)) ** spec.k
+def theoretical_fp_probability(distinct_values: float) -> float:
+    """Standard bloom filter formula p = (1 - e^(-k n / m))^k for n distinct
+    values, with the fixed Ethereum parameters m=2048, k=3."""
+    return (1 - math.exp(-BLOOM_K * distinct_values / BLOOM_BIT_LENGTH)) ** BLOOM_K

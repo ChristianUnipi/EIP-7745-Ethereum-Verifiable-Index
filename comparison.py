@@ -4,10 +4,10 @@ comparison.py
 
 Comparison of the EIP-7745 Log Index (eip7745_log_index.py) with the
 logsBloom used today by Ethereum (bloom_filter_ethereum.py) on the real
-"events" dataset (blocks 14,000,000-14,999,999, ~134.35 million unique event
-occurrences per block, from https://zenodo.org/records/7957141).
+"events" dataset, blocks 14,000,000-14,999,999, ~134.35 million unique event
+occurrences per block.
 
-File format ("events", checked byte by byte before writing the parser:
+File format "events":
 1,000,000 blocks, none truncated, reading ends exactly at end of file):
     blockId    uint32 big-endian (4 bytes)
     numEvents  uint32 big-endian (4 bytes)
@@ -36,10 +36,9 @@ insertion time is deliberately not measured (it depends on the machine).
    When there are more maps than `--eval-maps` (e.g. 1M maps with
    VALUES_PER_MAP = 2^8) an equispaced subset of maps is evaluated.
 3. Bloom filters: for every block (or every `--bloom-block-stride`-th block),
-   each query is tested against the block's filter; the exact set of values
-   of the block is the ground truth. Besides the real Ethereum filter
-   (2048 bits, k=3) some generic filters with more bits are evaluated, in
-   particular one with the same off-chain size per block as the Log Index.
+   each query is tested against the block's filter (the real Ethereum
+   logsBloom: 2048 bits, k=3); the exact set of values of the block is the
+   ground truth.
 4. Everything is normalised to the same quantity: expected false positives
    per query over the whole dataset (1M blocks), with a standard error
    computed from the variation across units (maps / blocks). The cost of a
@@ -72,9 +71,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from bloom_filter_ethereum import (
-    ETHEREUM_BLOOM,
+    BLOOM_SIZE_BYTES,
     BloomIndex,
-    BloomSpec,
     bit_mask,
     theoretical_fp_probability,
     value_digest,
@@ -96,6 +94,8 @@ BLOCK_HEADER = struct.Struct(">II")
 EVENT_SIZE = 52  # 20-byte address + 32-byte topic
 
 CLASSES = ("control", "cold", "warm", "hot")
+
+ETHEREUM_BLOOM_LABEL = "ethereum_2048_k3"
 
 # Crowdedness bins (events per block) for the bloom filter analysis.
 DENSITY_EDGES = [50, 100, 200, 400]
@@ -123,17 +123,6 @@ SWEEP_VALUES_PER_MAP = [(8, 24), (12, 24), (16, 24), (20, 24), (24, 24)]
 SWEEP_CONSTANT_TAG_BITS = [(8, 16), (12, 20), (20, 28), (24, 32)]
 # LOG2_MAP_WIDTH sweep at the original VALUES_PER_MAP = 2^16 (24 is the default).
 SWEEP_MAP_WIDTH = [(16, 16), (16, 20), (16, 28)]
-
-# Bloom filters compared. The Ethereum one is the real 2048-bit / k=3 filter;
-# 6448 bits = 806 bytes is about the off-chain size per block of the Log Index
-# with the default parameters (6 bytes per event x ~134 events per block).
-BLOOM_SPECS = [
-    ETHEREUM_BLOOM,
-    BloomSpec("generic_4096_k3", 4096, 3),
-    BloomSpec("generic_6448_k3", 6448, 3),
-    BloomSpec("generic_6448_k8", 6448, 8),
-    BloomSpec("generic_16384_k8", 16384, 8),
-]
 
 
 # ---------------------------------------------------------------------------
@@ -394,36 +383,32 @@ def run_bloom_worker(
     stride: int,
     total_blocks: int,
     queries: List[Query],
-    specs: List[BloomSpec],
     output_path: str,
 ) -> None:
+    """Evaluate the real Ethereum logsBloom (2048 bits, k=3; see
+    bloom_filter_ethereum.py) block by block. This is the only bloom filter
+    shape considered: the comparison is against Ethereum as it is today, not
+    against hypothetical larger filters."""
     query_values = [q.value for q in queries]
     class_of = [CLASSES.index(q.cls) for q in queries]
     query_index = {value: i for i, value in enumerate(query_values)}
-    query_digests = [value_digest(v) for v in query_values]
-    query_masks = [[bit_mask(spec, d) for d in query_digests] for spec in specs]
+    query_masks = [bit_mask(value_digest(v)) for v in query_values]
 
     n_classes = len(CLASSES)
-    per_spec = []
-    for spec in specs:
-        accs = {}
-        for cls in CLASSES:
-            accs[cls] = {
-                "n_queries": sum(1 for q in queries if q.cls == cls),
-                "units": 0,  # blocks evaluated
-                "sum_fp": 0,
-                "sum_fp2": 0,
-                "sum_tp": 0,
-                "sum_wasted": 0,  # false positives x events of the block (entries to examine)
-                "sum_wasted2": 0,
-            }
-        per_spec.append({
-            "spec": spec,
-            "accs": accs,
-            "false_negatives": 0,
-            # false positives of the control class by crowdedness of the block
-            "density": [{"blocks": 0, "fp_control": 0} for _ in range(len(DENSITY_EDGES) + 1)],
-        })
+    accs = {}
+    for cls in CLASSES:
+        accs[cls] = {
+            "n_queries": sum(1 for q in queries if q.cls == cls),
+            "units": 0,  # blocks evaluated
+            "sum_fp": 0,
+            "sum_fp2": 0,
+            "sum_tp": 0,
+            "sum_wasted": 0,  # false positives x events of the block (entries to examine)
+            "sum_wasted2": 0,
+        }
+    false_negatives = 0
+    # false positives of the control class by crowdedness of the block
+    density = [{"blocks": 0, "fp_control": 0} for _ in range(len(DENSITY_EDGES) + 1)]
     control_class = CLASSES.index("control")
 
     blocks_evaluated = 0
@@ -434,62 +419,50 @@ def run_bloom_worker(
         for address, topic in events:
             values.add(address)
             values.add(topic)
-        digests = [(v, value_digest(v)) for v in values]
         n_events = len(events)
         present_queries = [query_index[v] for v in values if v in query_index]
 
-        for s, entry in enumerate(per_spec):
-            spec = entry["spec"]
-            bits = 0
-            for _, digest in digests:
-                bits |= bit_mask(spec, digest)
-            masks = query_masks[s]
+        bits = 0
+        for value in values:
+            bits |= bit_mask(value_digest(value))
 
-            fp = [0] * n_classes
-            tp = [0] * n_classes
-            for i in range(len(masks)):
-                mask = masks[i]
-                if bits & mask == mask:
-                    if query_values[i] in values:
-                        tp[class_of[i]] += 1
-                    else:
-                        fp[class_of[i]] += 1
-            for i in present_queries:
-                if bits & masks[i] != masks[i]:
-                    entry["false_negatives"] += 1
-            density_bin = density_bin_of(n_events)
-            entry["density"][density_bin]["blocks"] += 1
-            entry["density"][density_bin]["fp_control"] += fp[control_class]
-            for c, cls in enumerate(CLASSES):
-                acc = entry["accs"][cls]
-                acc["units"] += 1
-                acc["sum_fp"] += fp[c]
-                acc["sum_fp2"] += fp[c] * fp[c]
-                acc["sum_tp"] += tp[c]
-                wasted = fp[c] * n_events
-                acc["sum_wasted"] += wasted
-                acc["sum_wasted2"] += wasted * wasted
+        fp = [0] * n_classes
+        tp = [0] * n_classes
+        for i, mask in enumerate(query_masks):
+            if bits & mask == mask:
+                if query_values[i] in values:
+                    tp[class_of[i]] += 1
+                else:
+                    fp[class_of[i]] += 1
+        for i in present_queries:
+            if bits & query_masks[i] != query_masks[i]:
+                false_negatives += 1
+        density_bin = density_bin_of(n_events)
+        density[density_bin]["blocks"] += 1
+        density[density_bin]["fp_control"] += fp[control_class]
+        for c, cls in enumerate(CLASSES):
+            acc = accs[cls]
+            acc["units"] += 1
+            acc["sum_fp"] += fp[c]
+            acc["sum_fp2"] += fp[c] * fp[c]
+            acc["sum_tp"] += tp[c]
+            wasted = fp[c] * n_events
+            acc["sum_wasted"] += wasted
+            acc["sum_wasted2"] += wasted * wasted
         blocks_evaluated += 1
         events_evaluated += n_events
     duration = time.perf_counter() - t0
 
     result = {
         "kind": "bloom",
+        "size_bytes": BLOOM_SIZE_BYTES,
         "stride": stride,
         "total_blocks": total_blocks,
         "blocks_evaluated": blocks_evaluated,
         "avg_events_per_block": events_evaluated / max(1, blocks_evaluated),
-        "specs": {
-            entry["spec"].name: {
-                "m_bits": entry["spec"].m_bits,
-                "k": entry["spec"].k,
-                "size_bytes": entry["spec"].size_bytes,
-                "classes": entry["accs"],
-                "false_negatives": entry["false_negatives"],
-                "density": entry["density"],
-            }
-            for entry in per_spec
-        },
+        "classes": accs,
+        "false_negatives": false_negatives,
+        "density": density,
         "duration_seconds": duration,
     }
     with open(output_path, "w", encoding="utf-8") as f:
@@ -615,7 +588,7 @@ def build_report(results_dir: str, scan: dict, queries: List[Query], settings: d
 
     default_tag = config_tag(16, 24)
     li_default = li[default_tag]
-    eth = bloom["specs"][ETHEREUM_BLOOM.name]
+    eth = bloom
     params_default = IndexParameters()
 
     out: List[str] = []
@@ -681,13 +654,12 @@ def build_report(results_dir: str, scan: dict, queries: List[Query], settings: d
     labels = density_bin_labels()
     w("| Structure | " + " | ".join(f"{label} events" for label in labels) + " | all blocks |")
     w("|---|" + "---|" * (len(labels) + 1))
-    for name, spec in bloom["specs"].items():
-        n_control = spec["classes"]["control"]["n_queries"]
-        cells = []
-        for b in spec["density"]:
-            cells.append(fmt(b["fp_control"] / (b["blocks"] * n_control)) if b["blocks"] else "-")
-        overall = spec["classes"]["control"]["sum_fp"] / max(1, spec["classes"]["control"]["units"] * n_control)
-        w(f"| bloom {name} | " + " | ".join(cells) + f" | {fmt(overall)} |")
+    n_control = eth["classes"]["control"]["n_queries"]
+    cells = []
+    for b in eth["density"]:
+        cells.append(fmt(b["fp_control"] / (b["blocks"] * n_control)) if b["blocks"] else "-")
+    overall = eth["classes"]["control"]["sum_fp"] / max(1, eth["classes"]["control"]["units"] * n_control)
+    w(f"| bloom {ETHEREUM_BLOOM_LABEL} | " + " | ".join(cells) + f" | {fmt(overall)} |")
     eth_blocks = [b["blocks"] for b in eth["density"]]
     total_eval = max(1, sum(eth_blocks))
     w("| (share of the blocks evaluated) | " + " | ".join(f"{100 * n / total_eval:.1f}%" for n in eth_blocks) + " | 100% |")
@@ -695,37 +667,14 @@ def build_report(results_dir: str, scan: dict, queries: List[Query], settings: d
     w(f"| **Log Index (EIP defaults)** | " + " | ".join([fmt(li_control / total_blocks)] * len(labels)) +
       f" | {fmt(li_control / total_blocks)} |")
 
-    # ---------------- parity
-    w("\n## 3. Same size: bigger bloom filters vs the Log Index\n")
-    w("What if the bloom filter had as many bytes as the Log Index? Expected false blocks per query over the "
-      "whole dataset. Only the 256-byte filter fits the block header today.\n")
-    w("| Structure | Bytes per block | control | cold | warm | hot |")
-    w("|---|---|---|---|---|---|")
-    for name, spec in bloom["specs"].items():
-        cells = []
-        for cls in ("control", "cold", "warm", "hot"):
-            v, se = fp_full_history(spec["classes"][cls], total_blocks)
-            cells.append(fmt(v, se))
-        w(f"| bloom {name} | {spec['size_bytes']} | " + " | ".join(cells) + " |")
-    cells = []
-    for cls in ("control", "cold", "warm", "hot"):
-        v, se = fp_full_history(li_default["classes"][cls], li_default["num_maps"])
-        cells.append(fmt(v, se))
-    w(f"| **Log Index (EIP defaults)** | {li_default['filter_bytes'] / total_blocks:,.0f} | " + " | ".join(cells) + " |")
-    w("\nThis is the fair test of the design, and its outcome is whatever the numbers above say: a bloom filter "
-      "with as many bytes and enough hash functions can match the Log Index on false positives. What only the "
-      "Log Index offers is the 32-byte header (a 806-byte bloom filter cannot be put in every header), the "
-      "compact proofs (section 4) and a false positive rate that does not depend on how crowded a block is "
-      "(previous table).\n")
-
     # ---------------- proofs
-    w("## 4. Bytes to search the whole history (modelled)\n")
+    w("\n## 3. Bytes to search the whole history (modelled)\n")
     w("Log Index: proof of the rows consulted in every map (analytic model, see eip7745_log_index.py) "
       "using the average number of layers and columns actually observed for a rare value (control class). "
       "Bloom: the filter of every block must be read.\n")
     w("| Structure | Bytes for a full-history search |")
     w("|---|---|")
-    w(f"| bloom {ETHEREUM_BLOOM.name} | {format_bytes(eth['size_bytes'] * total_blocks)} |")
+    w(f"| bloom {ETHEREUM_BLOOM_LABEL} | {format_bytes(eth['size_bytes'] * total_blocks)} |")
     ctrl = li_default["classes"]["control"]
     lookups = max(1, ctrl["units"] * ctrl["n_queries"])
     layers = ctrl["sum_layers"] / lookups
@@ -765,35 +714,34 @@ def build_report(results_dir: str, scan: dict, queries: List[Query], settings: d
         w("")
 
     sweep_table(
-        "5. Sweep of VALUES_PER_MAP (all other parameters at the EIP values)",
+        "4. Sweep of VALUES_PER_MAP (all other parameters at the EIP values)",
         "False positives (FP) are expected false candidates per query over the whole dataset. With the default "
         "LOG2_MAP_WIDTH = 24 the tag has 24 - log2(VALUES_PER_MAP) bits, so it disappears at 2^24.",
         SWEEP_VALUES_PER_MAP,
     )
     sweep_table(
-        "6. Sweep of VALUES_PER_MAP keeping 8 tag bits",
+        "5. Sweep of VALUES_PER_MAP keeping 8 tag bits",
         "LOG2_MAP_WIDTH grows with VALUES_PER_MAP so that every column keeps an 8-bit tag; columns become wider "
         "(bigger index) but the false positive rate per column read stays constant.",
         [(8, 16), (12, 20), (16, 24), (20, 28), (24, 32)],
     )
     sweep_table(
-        "7. Sweep of LOG2_MAP_WIDTH at VALUES_PER_MAP = 2^16",
+        "6. Sweep of LOG2_MAP_WIDTH at VALUES_PER_MAP = 2^16",
         "More bits per column mean more tag bits: fewer false positives, larger index.",
         [(16, 16), (16, 20), (16, 24), (16, 28)],
     )
 
     # ---------------- sanity
-    w("## 8. Sanity checks\n")
+    w("## 7. Sanity checks\n")
     w("| Configuration | maps evaluated / total | recall checks | recall mismatches |")
     w("|---|---|---|---|")
     for tag in sorted(li):
         d = li[tag]
         w(f"| {tag} | {d['evaluated_maps']:,} / {d['num_maps']:,} | {d['recall_checks']:,} | {d['recall_mismatches']} |")
-    fn = {name: s["false_negatives"] for name, s in bloom["specs"].items()}
-    w(f"\nBloom false negatives (must be 0): {fn}\n")
+    w(f"\nBloom false negatives (must be 0): {bloom['false_negatives']}\n")
     w("Theoretical false positive probability of the Ethereum filter for a block with n distinct values "
-      f"(n=100: {theoretical_fp_probability(ETHEREUM_BLOOM, 100):.2e}, n=250: {theoretical_fp_probability(ETHEREUM_BLOOM, 250):.2e}, "
-      f"n=500: {theoretical_fp_probability(ETHEREUM_BLOOM, 500):.2e}, n=1000: {theoretical_fp_probability(ETHEREUM_BLOOM, 1000):.2e}); "
+      f"(n=100: {theoretical_fp_probability(100):.2e}, n=250: {theoretical_fp_probability(250):.2e}, "
+      f"n=500: {theoretical_fp_probability(500):.2e}, n=1000: {theoretical_fp_probability(1000):.2e}); "
       f"average events per block in the dataset: {bloom['avg_events_per_block']:.1f}.\n")
     w("## Caveats\n")
     w("* Sizes count only the index, not the raw log data; the real EIP also stores the index entries in its tree.\n"
@@ -900,7 +848,7 @@ def main() -> None:
         return
     if args.worker == "bloom":
         run_bloom_worker(args.events_file, args.max_blocks, args.bloom_block_stride, args.total_blocks,
-                         load_queries(args.queries_file), BLOOM_SPECS, args.worker_output)
+                         load_queries(args.queries_file), args.worker_output)
         return
 
     os.makedirs(args.results_dir, exist_ok=True)
